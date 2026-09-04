@@ -73,8 +73,24 @@ class TinyTransformer(nn.Module):
         return self.head(x)
 
 
+def resolve_dtype(device: torch.device, dtype: torch.dtype) -> torch.dtype:
+    """
+    硬件兼容性回退:
+    - bf16 需要 CUDA 计算能力 >= 8.0(Ampere)。T4 是 Turing(sm_75),硬件不支持,
+      请求 bf16 时自动回退到 fp16 并打印提示,保证脚本在 T4 上无脑直接跑。
+    """
+    if dtype is torch.bfloat16 and device.type == "cuda":
+        major, _ = torch.cuda.get_device_capability(device)
+        if major < 8:
+            name = torch.cuda.get_device_name(device)
+            print(f"[提示] {name}(compute {major}.x)不支持 bfloat16,已回退到 float16。")
+            return torch.float16
+    return dtype
+
+
 def build_model(name: str, device: torch.device, dtype: torch.dtype = torch.float32):
     """按名字构造模型和一个匹配的示例输入。"""
+    dtype = resolve_dtype(device, dtype)
     if name == "mlp":
         model = TinyMLP().to(device=device, dtype=dtype).eval()
         example = torch.randn(32, 1024, device=device, dtype=dtype)

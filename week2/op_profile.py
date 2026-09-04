@@ -1,0 +1,74 @@
+"""
+第 2 周实践 1 & 2:profiler 分析 eager 模型,并把时间拆成各阶段。
+
+目标拆分(计划要求):
+    Python 开销 / dispatcher / 算子执行 / kernel launch / 同步等待
+
+profiler 的近似口径:
+- CPU self time  ≈ 框架 + dispatcher + Python 调度 + kernel launch(host 侧)
+- CUDA self time ≈ GPU 上真正执行 kernel 的时间(device 侧)
+- 两者的差,配合"Self CPU 很高但 CUDA 很低"可判断是 launch/框架 bound。
+
+运行:
+    python op_profile.py                 # 默认 transformer
+    python op_profile.py --model mlp
+"""
+import argparse
+
+import torch
+from torch.profiler import ProfilerActivity, profile
+
+from _common import build_model, get_device
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="transformer", choices=["mlp", "transformer"])
+    parser.add_argument("--iters", type=int, default=10)
+    args = parser.parse_args()
+
+    device = get_device()
+    torch.manual_seed(0)
+    model, example = build_model(args.model, device)
+    print(f"设备={device}  模型={args.model}\n")
+
+    activities = [ProfilerActivity.CPU]
+    if device.type == "cuda":
+        activities.append(ProfilerActivity.CUDA)
+
+    with torch.inference_mode():
+        for _ in range(5):  # warmup:排除首次分配 / cudnn benchmark
+            model(example)
+
+        with profile(activities=activities, record_shapes=True, with_stack=False) as prof:
+            for _ in range(args.iters):
+                model(example)
+
+    # ---- 按算子聚合,找 top 算子 ----
+    sort_key = "cuda_time_total" if device.type == "cuda" else "cpu_time_total"
+    print("=" * 90)
+    print("[1] 按算子聚合(找最耗时的 top-3)")
+    print("=" * 90)
+    print(prof.key_averages().table(sort_by=sort_key, row_limit=12))
+
+    # ---- 粗略总账:CPU 侧 vs GPU 侧 ----
+    ka = prof.key_averages()
+    total_cpu = sum(e.self_cpu_time_total for e in ka)
+    total_cuda = sum(getattr(e, "self_device_time_total", 0) for e in ka)
+    print("=" * 90)
+    print("[2] 阶段总账(单位 us,近似)")
+    print("=" * 90)
+    print(f"  Self CPU 合计 (框架+dispatcher+Python+launch): {total_cpu/1e3:10.1f} us")
+    if device.type == "cuda":
+        print(f"  Self CUDA 合计 (GPU kernel 真正执行)         : {total_cuda/1e3:10.1f} us")
+        ratio = total_cpu / total_cuda if total_cuda else float("inf")
+        print(f"  CPU/CUDA 比值 = {ratio:.2f}")
+        print("   -> 比值远大于 1 且 GPU 利用低 = launch / 框架 bound(小算子太多,该融合/上 CUDA Graph)。")
+    else:
+        print("  (当前非 CUDA 设备,GPU kernel 时间无法单独统计)")
+
+    print("\n[3] 判断计算受限 vs 带宽受限:见 compute_vs_bandwidth.py")
+
+
+if __name__ == "__main__":
+    main()
