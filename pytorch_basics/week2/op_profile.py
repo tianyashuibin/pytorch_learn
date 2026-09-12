@@ -51,6 +51,33 @@ def main():
     print("=" * 90)
     print(prof.key_averages().table(sort_by=sort_key, row_limit=12))
 
+    # ---- 打印一次前向的算子调用树,直观看父子包含关系 ----
+    print("=" * 90)
+    print("[1b] 算子调用树(展示父子包含关系,只打印每种顶层算子的第一次调用)")
+    print("=" * 90)
+
+    def fmt_us(ev):
+        # FunctionEvent 时间单位为 us
+        return f"{ev.self_cpu_time_total:.1f}us self-cpu, {getattr(ev, 'self_device_time_total', 0):.1f}us self-cuda"
+
+    def print_tree(ev, depth=0):
+        indent = "  " * depth
+        print(f"{indent}{ev.name}  [{fmt_us(ev)}]")
+        # 该算子直接启动的 GPU kernel
+        for k in getattr(ev, "kernels", None) or []:
+            print(f"{indent}  └─(kernel) {k.name}  [{k.duration:.1f}us]")
+        for child in getattr(ev, "cpu_children", None) or []:
+            print_tree(child, depth + 1)
+
+    seen = set()
+    for ev in prof.events():
+        if getattr(ev, "cpu_parent", None) is not None:
+            continue  # 只从顶层算子开始
+        if ev.name in seen:
+            continue  # 每种顶层算子只画一次(iters 会重复很多遍)
+        seen.add(ev.name)
+        print_tree(ev)
+
     # ---- 粗略总账:CPU 侧 vs GPU 侧 ----
     ka = prof.key_averages()
     # 注意:profiler 里时间字段单位是微秒(us),这里换算成 ms 打印。
@@ -72,7 +99,12 @@ def main():
         print(f"  Self CUDA 合计 (GPU kernel 真正执行)         : {total_cuda/1e3:10.1f} ms")
         ratio = total_cpu / total_cuda if total_cuda else float("inf")
         print(f"  CPU/CUDA 比值 = {ratio:.2f}")
-        print("   -> 比值远大于 1 且 GPU 利用低 = launch / 框架 bound(小算子太多,该融合/上 CUDA Graph)。")
+        if ratio > 3:
+            print("   -> 比值远大于 1 = launch / 框架 bound(CPU 侧开销主导,小算子太多,该融合 / 上 CUDA Graph)。")
+        elif ratio >= 1:
+            print("   -> 比值接近 1 = CPU 与 GPU 时间大致平衡,可关注 CPU 侧调度是否还能压缩。")
+        else:
+            print("   -> 比值小于 1 = GPU 计算受限(kernel 吃满时间,较健康),继续优化看算力 / 带宽。")
     else:
         print("  (当前非 CUDA 设备,GPU kernel 时间无法单独统计)")
 
