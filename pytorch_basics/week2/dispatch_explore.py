@@ -54,6 +54,17 @@ def show_dispatch_registrations():
         except Exception as e:
             print(f"   (无法 dump: {e})")
 
+    print("\n" + "-" * 70)
+    print("[2b] dispatch table:每个 DispatchKey 最终解析到哪个实现")
+    print("     (dump 只列显式注册的 key;table 会把 alias key 展开成每个具体 key 的落点)")
+    print("-" * 70)
+    for op in ("aten::linear", "aten::relu"):
+        print(f"\n--- {op} (table) ---")
+        try:
+            print(torch._C._dispatch_dump_table(op))
+        except Exception as e:
+            print(f"   (无法 dump table: {e})")
+
 
 def show_meta_no_compute(device):
     print("=" * 70)
