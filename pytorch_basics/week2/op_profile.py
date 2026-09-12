@@ -53,14 +53,23 @@ def main():
 
     # ---- 粗略总账:CPU 侧 vs GPU 侧 ----
     ka = prof.key_averages()
+    # 注意:profiler 里时间字段单位是微秒(us),这里换算成 ms 打印。
     total_cpu = sum(e.self_cpu_time_total for e in ka)
-    total_cuda = sum(getattr(e, "self_device_time_total", 0) for e in ka)
+    # 只对"真正的 GPU kernel"求和,避免重复计数:
+    # aten 算子(如 addmm)的 self_device_time_total 会把它启动的 kernel 时间也算进去,
+    # 而 kernel 自身条目(如 volta_sgemm)又记了一遍。kernel 条目没有 CPU 侧时间(self_cpu==0),
+    # 以此过滤出叶子 kernel,与 profiler 的 "Self CUDA time total" 对齐。
+    total_cuda = sum(
+        getattr(e, "self_device_time_total", 0)
+        for e in ka
+        if e.self_cpu_time_total == 0 and getattr(e, "self_device_time_total", 0) > 0
+    )
     print("=" * 90)
-    print("[2] 阶段总账(单位 us,近似)")
+    print("[2] 阶段总账(单位 ms,近似)")
     print("=" * 90)
-    print(f"  Self CPU 合计 (框架+dispatcher+Python+launch): {total_cpu/1e3:10.1f} us")
+    print(f"  Self CPU 合计 (框架+dispatcher+Python+launch): {total_cpu/1e3:10.1f} ms")
     if device.type == "cuda":
-        print(f"  Self CUDA 合计 (GPU kernel 真正执行)         : {total_cuda/1e3:10.1f} us")
+        print(f"  Self CUDA 合计 (GPU kernel 真正执行)         : {total_cuda/1e3:10.1f} ms")
         ratio = total_cpu / total_cuda if total_cuda else float("inf")
         print(f"  CPU/CUDA 比值 = {ratio:.2f}")
         print("   -> 比值远大于 1 且 GPU 利用低 = launch / 框架 bound(小算子太多,该融合/上 CUDA Graph)。")
