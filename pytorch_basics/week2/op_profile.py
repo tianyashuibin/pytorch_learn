@@ -60,6 +60,17 @@ def main():
         # FunctionEvent 时间单位为 us
         return f"{ev.self_cpu_time_total:.1f}us self-cpu, {getattr(ev, 'self_device_time_total', 0):.1f}us self-cuda"
 
+    def is_noise(ev):
+        # 过滤掉非 aten 算子的噪音,只留 aten 算子 + 它们直接挂的 kernel:
+        # - CUDA runtime API 调用(cudaLaunchKernel / cudaOccupancy... / cudaStreamIsCapturing 等)
+        # - profiler / 内存等杂项事件
+        name = ev.name
+        if name.startswith("cuda"):
+            return True
+        if name in ("Activity Buffer Request",) or name.startswith("Memset"):
+            return True
+        return False
+
     def print_tree(ev, depth=0):
         indent = "  " * depth
         print(f"{indent}{ev.name}  [{fmt_us(ev)}]")
@@ -67,12 +78,19 @@ def main():
         for k in getattr(ev, "kernels", None) or []:
             print(f"{indent}  └─(kernel) {k.name}  [{k.duration:.1f}us]")
         for child in getattr(ev, "cpu_children", None) or []:
+            if is_noise(child):
+                continue
             print_tree(child, depth + 1)
 
     seen = set()
     for ev in prof.events():
         if getattr(ev, "cpu_parent", None) is not None:
             continue  # 只从顶层算子开始
+        if is_noise(ev):
+            continue  # 跳过 runtime / 杂项事件
+        # 顶层的纯 kernel 行(self_cpu==0)是 kernel 条目自身,与父算子挂的 kernel 重复,跳过
+        if ev.self_cpu_time_total == 0 and getattr(ev, "self_device_time_total", 0) > 0:
+            continue
         if ev.name in seen:
             continue  # 每种顶层算子只画一次(iters 会重复很多遍)
         seen.add(ev.name)
