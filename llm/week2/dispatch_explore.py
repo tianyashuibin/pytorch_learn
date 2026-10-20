@@ -141,27 +141,26 @@ def inference_mode_overhead_optimize(device: torch.device, dtype: torch.dtype) -
 
 
 def inference_mode_overhead_optimize2(device: torch.device, dtype: torch.dtype) -> None:
-    from torch.profiler import ProfilerActivity, profile
-    
-    x = torch.randn(64, 64, device=device, dtype=dtype, requires_grad=True)
+    """eager vs torch.compile(融合) vs reduce-overhead(CUDA graph) 的 launch 开销对比。"""
+    # 编译、预热、测量都放在同一个 inference_mode 里，避免 grad 模式变化触发重编译
+    with torch.inference_mode():
+        x = torch.randn(64, 64, device=device, dtype=dtype)
 
-    def loop(n=2000):
-        for _ in range(n):
-            _ = x + 1.0
-            _ = _ * 2.0
+        def step():
+            return (x + 1.0) * 2.0   # 纯计算：无 sync、无大循环，cudagraph 才能生效
+
+        fn_fused = torch.compile(step)
+        fn_graph = torch.compile(step, mode="reduce-overhead")
+
+        fns = [("eager", step), ("compile", fn_fused), ("cudagraph", fn_graph)]
+        for _, fn in fns:            # 预热 / 触发编译与 graph 录制
+            for _ in range(5):
+                fn()
         sync(device)
 
-    # 预热
-    loop(200)
-
-    fn_fused = torch.compile(loop)
-    fn_graph = torch.compile(loop, mode="reduce-overhead")
-    fn_fused(200)
-    fn_graph(200)
-
-    for name, fn in [("eager", loop), ("compile", fn_fused), ("cudagraph", fn_graph)]:
-        t_submit, t_total, t_gpu = measure(fn, 2000, device)
-        print(f"{name:10s} submit={t_submit * 1000:.1f} ms  total={t_total * 1000:.1f} ms  gpu_span={t_gpu * 1000:.1f} ms")
+        for name, fn in fns:
+            t_submit, t_total, t_gpu = measure(fn, 20000, device)
+            print(f"{name:10s} submit={t_submit * 1000:.1f} ms  total={t_total * 1000:.1f} ms  gpu_span={t_gpu * 1000:.1f} ms")
 
 
 def measure(fn, n, device: torch.device):
