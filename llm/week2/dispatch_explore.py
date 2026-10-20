@@ -190,6 +190,7 @@ def main() -> None:
     trace_one_op(device, dtype)
     inference_mode_overhead(device, dtype)
     inference_mode_overhead_optimize(device, dtype)
+    inference_mode_overhead_optimize2(device, dtype)
 
 
 if __name__ == "__main__":
