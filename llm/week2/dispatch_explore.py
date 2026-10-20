@@ -140,14 +140,23 @@ def inference_mode_overhead_optimize(device: torch.device, dtype: torch.dtype) -
     print("      去掉 autograd 记账能看到明显收益。大 kernel 上则相对可忽略。\n")
 
 
-def inference_mode_overhead_optimize2(device: torch.device, dtype: torch.dtype) -> None:
-    """eager vs torch.compile(融合) vs reduce-overhead(CUDA graph) 的 launch 开销对比。"""
+def inference_mode_overhead_optimize2(
+    device: torch.device, dtype: torch.dtype, num_ops: int = 100
+) -> None:
+    """eager vs torch.compile(融合) vs reduce-overhead(CUDA graph) 的 launch 开销对比。
+
+    num_ops：每次调用里串联多少对 (+1, *2)。图太小时 compile/cudagraph 的固定
+    Python 开销会盖过收益，所以要让图足够大才能看到优势。
+    """
     # 编译、预热、测量都放在同一个 inference_mode 里，避免 grad 模式变化触发重编译
     with torch.inference_mode():
         x = torch.randn(64, 64, device=device, dtype=dtype)
 
         def step():
-            return (x + 1.0) * 2.0   # 纯计算：无 sync、无大循环，cudagraph 才能生效
+            y = x
+            for _ in range(num_ops):
+                y = (y + 1.0) * 2.0   # 串联，结果被使用，不会被当作死代码消掉
+            return y   # 纯计算：无 sync，cudagraph 才能生效
 
         fn_fused = torch.compile(step)
         fn_graph = torch.compile(step, mode="reduce-overhead")
@@ -159,7 +168,7 @@ def inference_mode_overhead_optimize2(device: torch.device, dtype: torch.dtype) 
         sync(device)
 
         for name, fn in fns:
-            t_submit, t_total, t_gpu = measure(fn, 20000, device)
+            t_submit, t_total, t_gpu = measure(fn, 2000, device)
             print(f"{name:10s} submit={t_submit * 1000:.1f} ms  total={t_total * 1000:.1f} ms  gpu_span={t_gpu * 1000:.1f} ms")
 
 
