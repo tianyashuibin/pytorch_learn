@@ -140,6 +140,47 @@ def inference_mode_overhead_optimize(device: torch.device, dtype: torch.dtype) -
     print("      去掉 autograd 记账能看到明显收益。大 kernel 上则相对可忽略。\n")
 
 
+def inference_mode_overhead_optimize2(device: torch.device, dtype: torch.dtype) -> None:
+    from torch.profiler import ProfilerActivity, profile
+    
+    x = torch.randn(64, 64, device=device, dtype=dtype, requires_grad=True)
+
+    def loop(n=2000):
+        for _ in range(n):
+            _ = x + 1.0
+            _ = _ * 2.0
+        sync(device)
+
+    # 预热
+    loop(200)
+
+    fn_fused = torch.compile(loop)
+    fn_graph = torch.compile(loop, mode="reduce-overhead")
+    fn_fused(200)
+    fn_graph(200)
+
+    for name, fn in [("eager", loop), ("compile", fn_fused), ("cudagraph", fn_graph)]:
+        t_submit, t_total, t_gpu = measure(fn, 2000, device)
+        print(f"{name:10s} submit={t_submit * 1000:.1f} ms  total={t_total * 1000:.1f} ms  gpu_span={t_gpu * 1000:.1f} ms")
+
+
+def measure(fn, n, device: torch.device):
+    import time
+
+    sync(device)
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    t0 = time.perf_counter()
+    start.record()
+    for _ in range(n):
+        fn()
+    t_submit = time.perf_counter() - t0   # CPU 提交完所有 kernel 的时间
+    end.record()
+    sync(device)
+    t_total = time.perf_counter() - t0    # 含等 GPU 排空
+    t_gpu_span = start.elapsed_time(end) / 1000  # GPU 时间线上的跨度
+    return t_submit, t_total, t_gpu_span
+
+
 def main() -> None:
     device = pick_device()
     dtype = pick_dtype(device)
