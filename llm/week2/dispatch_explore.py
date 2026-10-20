@@ -70,7 +70,7 @@ def inference_mode_overhead(device: torch.device, dtype: torch.dtype) -> None:
     """量化 inference_mode 省下的 dispatch/记账开销（小算子上更明显）。"""
     import time
 
-    x = torch.randn(64, 64, device=device, dtype=dtype)
+    x = torch.randn(64, 64, device=device, dtype=dtype, requires_grad=True)
 
     def loop(n=2000):
         for _ in range(n):
@@ -81,14 +81,57 @@ def inference_mode_overhead(device: torch.device, dtype: torch.dtype) -> None:
     # 预热
     loop(200)
 
+    loopnum = 200000
     t0 = time.perf_counter()
-    loop()
+    loop(loopnum)
     normal = time.perf_counter() - t0
 
     with torch.inference_mode():
         t0 = time.perf_counter()
-        loop()
+        loop(loopnum)
         infer = time.perf_counter() - t0
+
+    print("=== inference_mode 对小算子的框架开销影响 ===")
+    print(f"普通模式:        {normal * 1000:.1f} ms")
+    print(f"inference_mode:  {infer * 1000:.1f} ms")
+    print("要点：小算子（elementwise）时间被 Python + dispatch 开销主导，")
+    print("      去掉 autograd 记账能看到明显收益。大 kernel 上则相对可忽略。\n")
+
+
+def inference_mode_overhead_optimize(device: torch.device, dtype: torch.dtype) -> None:
+    """量化 inference_mode 省下的 dispatch/记账开销（小算子上更明显）。"""
+    import time
+    from torch.profiler import ProfilerActivity, profile
+
+    x = torch.randn(64, 64, device=device, dtype=dtype, requires_grad=True)
+
+    def loop(n=2000):
+        for _ in range(n):
+            _ = x + 1.0
+            _ = _ * 2.0
+        sync(device)
+
+    # 预热
+    loop(200)
+
+    activities = [ProfilerActivity.CPU]
+    if device.type == "cuda":
+        activities.append(ProfilerActivity.CUDA)
+
+    loopnum = 200
+    t0 = time.perf_counter()
+    with profile(activities=activities, record_shapes=True) as prof:
+        loop(loopnum)
+    normal = time.perf_counter() - t0
+    sort_key = "cuda_time_total" if device.type == "cuda" else "cpu_time_total"
+    print(prof.key_averages().table(sort_by=sort_key, row_limit=10))
+
+    with torch.inference_mode():
+        t0 = time.perf_counter()
+        with profile(activities=activities, record_shapes=True) as prof:
+            loop(loopnum)
+        infer = time.perf_counter() - t0
+        print(prof.key_averages().table(sort_by=sort_key, row_limit=10))
 
     print("=== inference_mode 对小算子的框架开销影响 ===")
     print(f"普通模式:        {normal * 1000:.1f} ms")
@@ -105,6 +148,7 @@ def main() -> None:
     show_dispatch_keys(device, dtype)
     trace_one_op(device, dtype)
     inference_mode_overhead(device, dtype)
+    inference_mode_overhead_optimize(device, dtype)
 
 
 if __name__ == "__main__":
