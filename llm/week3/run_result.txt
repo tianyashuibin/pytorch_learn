@@ -1,0 +1,52 @@
+(torch-dev) [miaohy@reco-gpu-01 week3]$ python generate.py --prompt-len 64 --gen-len 32 --verbose
+[env] device=cuda dtype=torch.bfloat16
+[prefill] 处理 64 个 token，KV cache 已填入 64 格；cache 张量形状=(1, 8, 2048, 64)，已用=(1, 8, 64, 64)
+[decode step 0] 处理 1 个 token，start_pos=64，attention 读取历史长度=65
+[decode step 1] 处理 1 个 token，start_pos=65，attention 读取历史长度=66
+[decode step 2] 处理 1 个 token，start_pos=66，attention 读取历史长度=67
+
+==================== prefill vs decode ====================
+prefill（64 tokens 一次）: 12.056 ms
+decode （1 token 一步）           : 8.735 ms
+每 token 摊薄：prefill 0.188 ms/tok  vs  decode 8.735 ms/tok
+生成 token 数：32
+
+要点：prefill 摊到每 token 更快（大矩阵乘吃满算力），
+      decode 每 token 更贵（seq=1 的小 kernel，且要读越来越长的 KV cache）。
+
+
+
+
+
+
+(torch-dev) [miaohy@reco-gpu-01 week3]$ python kvcache_anatomy.py
+[env] device=cuda dtype=torch.bfloat16 (2 bytes/elem)
+
+=== 问题 1：KV cache 显存随序列长度增长 ===
+模型：dim=512 layers=8 heads=8 head_dim=64
+公式：2 * layers * batch * n_heads * seq_len * head_dim * dtype_bytes
+
+  seq_len=  128  batch=  1  ->  KV cache =      2.0 MB
+  seq_len=  128  batch= 32  ->  KV cache =     64.0 MB
+  seq_len=  512  batch=  1  ->  KV cache =      8.0 MB
+  seq_len=  512  batch= 32  ->  KV cache =    256.0 MB
+  seq_len= 2048  batch=  1  ->  KV cache =     32.0 MB
+  seq_len= 2048  batch= 32  ->  KV cache =   1024.0 MB
+  seq_len= 8192  batch=  1  ->  KV cache =    128.0 MB
+  seq_len= 8192  batch= 32  ->  KV cache =   4096.0 MB
+  -> KV cache ∝ seq_len × batch，线性增长。长上下文 / 高并发时它就是显存主要消耗者，
+     这正是引擎要做 KV cache 量化(第8周)和分页(第6周)的原因。
+
+=== 问题 2：decode 过程中 cache 的变化 ===
+预分配 cache 形状（固定不变）: K=(1, 8, 2048, 64)
+prefill 后：已用格数 = 10（后面全是预留的 0）
+decode step 0: 写入 cache[10]，已用格数 = 11，cache 张量形状仍是 (1, 8, 2048, 64)（地址没变）
+decode step 1: 写入 cache[11]，已用格数 = 12，cache 张量形状仍是 (1, 8, 2048, 64)（地址没变）
+decode step 2: 写入 cache[12]，已用格数 = 13，cache 张量形状仍是 (1, 8, 2048, 64)（地址没变）
+decode step 3: 写入 cache[13]，已用格数 = 14，cache 张量形状仍是 (1, 8, 2048, 64)（地址没变）
+
+=== 问题 3：为什么预分配 max_seq_len ===
+  cache 张量地址在整个 generate 中不变 —— 这是第 5 周 CUDA Graph 能 capture/replay 的前提
+  （CUDA Graph 要求输入/输出地址固定）。代价是即使没生成那么长，显存也先占着；
+  引擎用分页(PagedAttention)把'一大块预留'切成小块按需分配，缓解这个浪费。
+(torch-dev) [miaohy@reco-gpu-01 week3]$ 
