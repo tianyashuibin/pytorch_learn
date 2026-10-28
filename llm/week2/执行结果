@@ -1,0 +1,145 @@
+(torch-dev) [miaohy@reco-gpu-01 week2]$ python dispatch_explore.py 
+[env] device=cuda dtype=torch.bfloat16 torch=2.14.0+cu130
+
+=== DispatchKeySet 随上下文变化 ===
+普通 tensor:            DispatchKeySet(CUDA, ADInplaceOrView, AutogradCUDA, AutocastCUDA)
+requires_grad=True:     DispatchKeySet(CUDA, ADInplaceOrView, AutogradCUDA, AutocastCUDA)  <- 多了 Autograd 相关 key
+inference_mode 内:      DispatchKeySet(CUDA, AutocastCUDA)  <- 关掉了 autograd 记账
+要点：key 越多，dispatch 经过的层越多。推理时用 inference_mode 就是砍掉不需要的层。
+
+=== 一次 torch.matmul 的算子/内核分解 ===
+USDT:2026-10-19 12:19:28 3855198:3855198 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 12:19:28 3855198:3855198 SyncActivityProfilerHandler.cpp:46] profiler_stop
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                           aten::matmul         0.36%       9.499us        98.21%       2.562ms       2.562ms       0.000us         0.00%     130.322us     130.322us             1  
+                                               aten::mm         4.10%     107.061us        97.85%       2.552ms       2.552ms     130.322us       100.00%     130.322us     130.322us             1  
+void magma_sgemmEx_kernel<float, __nv_bfloat16, __nv...         0.00%       0.000us         0.00%       0.000us       0.000us     130.322us       100.00%     130.322us     130.322us             1  
+                                Activity Buffer Request        92.20%       2.405ms        92.20%       2.405ms       2.405ms       0.000us         0.00%       0.000us       0.000us             1  
+                                       cudaLaunchKernel         1.54%      40.143us         1.54%      40.143us      40.143us       0.000us         0.00%       0.000us       0.000us             1  
+                                  cudaDeviceSynchronize         1.79%      46.707us         1.79%      46.707us      23.353us       0.000us         0.00%       0.000us       0.000us             2  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 2.609ms
+Self CUDA time total: 130.322us
+
+要点：一行 Python 的 matmul，在 dispatcher 之下会落到 aten::matmul -> aten::mm，
+      再发射具体的 GEMM CUDA kernel。这就是 Python->ATen->dispatch->kernel 的链路。
+
+=== inference_mode 对小算子的框架开销影响 ===
+普通模式:        55.1 ms
+inference_mode:  52.8 ms
+要点：小算子（elementwise）时间被 Python + dispatch 开销主导，
+      去掉 autograd 记账能看到明显收益。大 kernel 上则相对可忽略。
+
+
+
+
+
+
+
+
+
+
+(torch-dev) [miaohy@reco-gpu-01 week2]$ python profile_layers.py 
+[env] device=cuda dtype=torch.bfloat16 torch=2.14.0+cu130
+
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 201/201 [00:00<00:00, 6427.73it/s]
+USDT:2026-10-19 12:21:18 3855361:3855361 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-19 12:21:20 3855361:3855361 SyncActivityProfilerHandler.cpp:46] profiler_stop
+=== 分层归因：TinyLlama forward (prefill) ===
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                           aten::matmul         1.93%      18.275ms        11.45%     108.390ms      54.467us       0.000us         0.00%     993.683ms     499.338us          1990  
+                                           aten::linear         0.57%       5.382ms         8.61%      81.535ms      52.603us       0.000us         0.00%     982.374ms     633.790us          1550  
+                                               aten::mm         3.69%      34.968ms         5.03%      47.592ms      30.705us     982.374ms        93.66%     982.374ms     633.790us          1550  
+void magma_sgemmEx_kernel<float, __nv_bfloat16, __nv...         0.00%       0.000us         0.00%       0.000us       0.000us     982.374ms        93.66%     982.374ms     633.790us          1550  
+                     aten::scaled_dot_product_attention         0.28%       2.682ms        29.12%     275.631ms       1.253ms       0.000us         0.00%      31.097ms     141.350us           220  
+               aten::_scaled_dot_product_attention_math         1.20%      11.385ms        28.83%     272.949ms       1.241ms       0.000us         0.00%      31.097ms     141.350us           220  
+                                              aten::mul         3.29%      31.109ms        36.93%     349.603ms     141.540us      13.017ms         1.24%      13.017ms       5.270us          2470  
+                                            aten::copy_         2.18%      20.630ms         4.44%      42.015ms      13.423us      12.337ms         1.18%      12.337ms       3.942us          3130  
+                                              aten::bmm         2.75%      26.008ms         3.17%      29.985ms      68.149us      11.309ms         1.08%      11.309ms      25.703us           440  
+                                               aten::to         0.58%       5.466ms         7.09%      67.162ms      21.321us       0.000us         0.00%       9.034ms       2.868us          3150  
+                                         aten::_to_copy         1.46%      13.863ms         6.52%      61.696ms      24.978us       0.000us         0.00%       9.034ms       3.657us          2470  
+                                    aten::_safe_softmax         0.33%       3.144ms         4.91%      46.506ms     211.392us       0.000us         0.00%       7.054ms      32.063us           220  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 946.676ms
+Self CUDA time total: 1.049s
+
+
+--- 粗判断 ---
+CPU self 总时间 ≈ 2872.59 ms（Python + dispatch + launch）
+CUDA 总时间     ≈ 4173.56 ms（kernel 执行）
+>> GPU 占主导：偏 compute/bandwidth 受限（典型 prefill / 大 GEMM）
+
+提示：在上面表里找 self CUDA time 最高的 3 个算子，
+      matmul/attention 类通常 compute 受限，elementwise/norm/copy 类通常 bandwidth 受限。
+      这就是本周验收要求的'找出三个最耗时算子并判断受限类型'。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+(torch-dev) [miaohy@reco-gpu-01 week2]$ python allocator_behavior.py 
+[env] device=cuda dtype=torch.bfloat16 torch=2.14.0+cu130
+
+=== 演示 1：释放显存后 reserved 不下降（缓存复用）===
+[初始                          ] allocated=     0.0MB  reserved=     2.0MB  缓存/碎片=    2.0MB
+[分配大块后                       ] allocated=   512.0MB  reserved=   514.0MB  缓存/碎片=    2.0MB
+[del 之后(未 empty_cache)       ] allocated=     0.0MB  reserved=   514.0MB  缓存/碎片=  514.0MB
+  -> allocated 掉了，reserved 没掉：显存被 allocator 缓存着等复用。
+
+[再次分配同样大小                    ] allocated=   512.0MB  reserved=   514.0MB  缓存/碎片=    2.0MB
+  -> reserved 基本不变：这次分配命中了缓存，没向 driver 要新显存（快且无隐式同步）。
+[empty_cache 之后              ] allocated=     0.0MB  reserved=     0.0MB  缓存/碎片=    0.0MB
+  -> 手动 empty_cache 才把缓存还给 driver。生产中一般不频繁调用（会打断复用）。
+
+=== 演示 2：碎片（reserved 明显大于 allocated）===
+[交替分配后                       ] allocated=  1280.0MB  reserved=  1280.0MB  缓存/碎片=    0.0MB
+[释放一半后                       ] allocated=   768.0MB  reserved=  1280.0MB  缓存/碎片=  512.0MB
+  -> reserved 和 allocated 之间的差就是碎片 + 缓存。KV cache 场景下，
+     碎片会直接吃掉本可用于更多请求的显存——这正是引擎要做分页(PagedAttention)的动机。
+
+=== memory_summary（allocator 的详细账本，重点看 Reserved / Allocated 段）===
+|===========================================================================|
+|                  PyTorch CUDA memory summary, device ID 0                 |
+|---------------------------------------------------------------------------|
+|            CUDA OOMs: 0            |        cudaMalloc retries: 0         |
+|===========================================================================|
+|        Metric         | Cur Usage  | Peak Usage | Tot Alloc  | Tot Freed  |
+|---------------------------------------------------------------------------|
+| Allocated memory      |      0 B   |   1280 MiB |   2304 MiB |   2304 MiB |
+|---------------------------------------------------------------------------|
+| Active memory         |      0 B   |   1280 MiB |   2304 MiB |   2304 MiB |
+|---------------------------------------------------------------------------|
+| Requested memory      |      0 B   |   1280 MiB |   2304 MiB |   2304 MiB |
+|---------------------------------------------------------------------------|
+| GPU reserved memory   |   1280 MiB |   1280 MiB |   1794 MiB | 526336 KiB |
+|---------------------------------------------------------------------------|
+| Non-releasable memory |      0 B   |   2047 KiB |   2047 KiB |   2047 KiB |
+|---------------------------------------------------------------------------|
+| Allocations           |       0    |       8    |      11    |      11    |
+|---------------------------------------------------------------------------|
+| Active allocs         |       0    |       8    |      11    |      11    |
+|---------------------------------------------------------------------------|
+| GPU reserved segments |       8    |       8    |      10    |       2    |
+|---------------------------------------------------------------------------|
+| Non-releasable allocs |       0    |       1    |       1    |       1    |
+|---------------------------------------------------------------------------|
+| Oversize allocations  |       0    |       0    |       0    |       0    |
+|---------------------------------------------------------------------------|
+| Oversize GPU segments |       0    |       0    |       0    |       0    |
+|===========================================================================|

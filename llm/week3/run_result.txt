@@ -1,20 +1,18 @@
-(torch-dev) [miaohy@reco-gpu-01 week3]$ python generate.py --prompt-len 64 --gen-len 32 --verbose
-[env] device=cuda dtype=torch.bfloat16
+(vllm-cu130) [miaohy@reco-gpu-01 week3]$ python generate.py --prompt-len 64 --gen-len 32 --verbose
+[env] device=cuda dtype=torch.float16
 [prefill] 处理 64 个 token，KV cache 已填入 64 格；cache 张量形状=(1, 8, 2048, 64)，已用=(1, 8, 64, 64)
 [decode step 0] 处理 1 个 token，start_pos=64，attention 读取历史长度=65
 [decode step 1] 处理 1 个 token，start_pos=65，attention 读取历史长度=66
 [decode step 2] 处理 1 个 token，start_pos=66，attention 读取历史长度=67
 
 ==================== prefill vs decode ====================
-prefill（64 tokens 一次）: 12.056 ms
-decode （1 token 一步）           : 8.735 ms
-每 token 摊薄：prefill 0.188 ms/tok  vs  decode 8.735 ms/tok
+prefill（64 tokens 一次）: 6.873 ms
+decode （1 token 一步）           : 6.469 ms
+每 token 摊薄：prefill 0.107 ms/tok  vs  decode 6.469 ms/tok
 生成 token 数：32
 
 要点：prefill 摊到每 token 更快（大矩阵乘吃满算力），
       decode 每 token 更贵（seq=1 的小 kernel，且要读越来越长的 KV cache）。
-
-
 
 
 
