@@ -23,10 +23,10 @@ def pick_device() -> torch.device:
 
 def pick_dtype(device: torch.device) -> torch.dtype:
     if device.type == "cuda":
-        # 优先 bf16（数值更稳），不支持则 fp16。
-        if torch.cuda.is_bf16_supported():
-            return torch.bfloat16
-        return torch.float16
+        # is_bf16_supported() 在 T4 等老卡上也可能返回 True（软件模拟），
+        # 而 Inductor/Triton 需要原生支持（算力 >= 8.0）
+        native_bf16 = torch.cuda.get_device_capability(device)[0] >= 8
+        return torch.bfloat16 if native_bf16 else torch.float16
     return torch.float32
 
 
