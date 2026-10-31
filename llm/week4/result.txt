@@ -1,0 +1,91 @@
+(vllm-cu130) [miaohy@reco-gpu-01 week4]$ python naive_vs_flash.py 
+[env] device=cuda dtype=torch.float16
+
+ seq_len |   naive ms   naive MB |    sdpa ms    sdpa MB | 加速
+------------------------------------------------------------------------
+     256 |      0.125       14.1 |      0.044       10.1 |  2.8x
+     512 |      0.288       28.1 |      0.146       12.1 |  2.0x
+    1024 |      1.036       80.1 |      0.437       16.1 |  2.4x
+    2048 |      4.078      280.1 |      1.482       24.1 |  2.8x
+    4096 |     18.338     1064.1 |      5.127       40.1 |  3.6x
+
+要点：
+  - naive 的 [seq,seq] scores 让显存随 seq^2 暴涨（4096 时几个 GB）。
+  - SDPA(flash) 显存随 seq 线性，且更快——长序列差距越大。
+  - 这就是所有 LLM 引擎都用 FlashAttention 变体的原因。
+  （CPU/MPS 上 flash 后端可能不可用，看不出显存差异属正常，重点理解机制。）
+
+
+
+
+(vllm-cu130) [miaohy@reco-gpu-01 week4]$ python paged_attention_demo.py 
+[env] device=cuda dtype=torch.float16
+
+序列长度=10, block_size=4 -> 需要 3 个逻辑 block
+block_table（逻辑->物理）: [7, 2, 11]
+  逻辑 token 0-3  -> 物理 block 7
+  逻辑 token 4-7  -> 物理 block 2
+  逻辑 token 8-9  -> 物理 block 11（只用前 2 格）
+
+gather 后逻辑连续 K 形状: (10, 4, 32)（物理上来自乱序 block）
+attention 输出形状: (1, 4, 1, 32)  ✓ 计算正确，物理不连续不影响结果
+
+=== 连续预分配 vs 分页 的显存对比（假设 max_seq_len=2048）===
+  连续预分配: 每条序列占 2048 格（实际只用 10 格，浪费 2038 格）
+  分页:       只分配 12 格（3 个 block），浪费 ≤ block_size-1 = 3 格
+  -> 分页把'按最长预留'变成'按需增长'，显存利用率大幅提升。
+
+=== 附加好处：prefix sharing ===
+  两条请求若 prompt 前缀相同，可以让它们的 block_table 前几项指向同一批物理 block，
+  KV cache 直接复用、无需重算 —— 这就是 SGLang RadixCache / vLLM prefix caching 的基础。
+  （对照 [[project_sglang_vs_vllm_kvcache]]，第 6 周细看两者复用粒度差异。）
+
+
+
+
+
+### 下面的输出比较长，因为T4上面部分包用不了的原因
+
+(vllm-cu130) [miaohy@reco-gpu-01 week4]$ python sdpa_backends.py 
+[env] device=cuda dtype=torch.float16 torch=2.13.0+cu130
+
+=== 强制各后端，看谁能跑、谁最快（is_causal=True）===
+/home/miaohy/pytorch_learn/llm/week4/sdpa_backends.py:65: UserWarning: Memory efficient kernel not used because: (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:1104.)
+  ms = timed(lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True),
+/home/miaohy/pytorch_learn/llm/week4/sdpa_backends.py:65: UserWarning: Memory Efficient attention has been runtime disabled. (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/native/transformers/sdp_utils_cpp.h:571.)
+  ms = timed(lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True),
+/home/miaohy/pytorch_learn/llm/week4/sdpa_backends.py:65: UserWarning: Flash attention kernel not used because: (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:1106.)
+  ms = timed(lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True),
+/home/miaohy/pytorch_learn/llm/week4/sdpa_backends.py:65: UserWarning: Flash attention only supports gpu architectures in the range [sm80, sm121]. Attempting to run on a sm 7.5 gpu. (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:443.)
+  ms = timed(lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True),
+/home/miaohy/pytorch_learn/llm/week4/sdpa_backends.py:65: UserWarning: cuDNN attention kernel not used because: (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:1108.)
+  ms = timed(lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True),
+/home/miaohy/pytorch_learn/llm/week4/sdpa_backends.py:65: UserWarning: cuDNN attention has been runtime disabled. (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:831.)
+  ms = timed(lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True),
+  FLASH_ATTENTION        不可用: No available kernel. Aborting execution.
+  EFFICIENT_ATTENTION       0.273 ms
+/home/miaohy/pytorch_learn/llm/week4/sdpa_backends.py:65: UserWarning: Flash attention has been runtime disabled. (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/native/transformers/sdp_utils_cpp.h:559.)
+  ms = timed(lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True),
+/home/miaohy/pytorch_learn/llm/week4/sdpa_backends.py:65: UserWarning: cuDNN MHA only supports gpu architectures in the range [sm80, sm121]. Attempting to run on a sm 7.5 gpu. (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:772.)
+  ms = timed(lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True),
+  CUDNN_ATTENTION        不可用: No available kernel. Aborting execution.
+  MATH                      4.280 ms
+
+=== 什么条件会让 flash 掉回 math ===
+/home/miaohy/pytorch_learn/llm/week4/sdpa_backends.py:76: UserWarning: Memory efficient kernel not used because: (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:1104.)
+  F.scaled_dot_product_attention(weird, weird, weird, is_causal=True)
+/home/miaohy/pytorch_learn/llm/week4/sdpa_backends.py:76: UserWarning: Memory Efficient attention has been runtime disabled. (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/native/transformers/sdp_utils_cpp.h:571.)
+  F.scaled_dot_product_attention(weird, weird, weird, is_causal=True)
+/home/miaohy/pytorch_learn/llm/week4/sdpa_backends.py:76: UserWarning: Flash attention kernel not used because: (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:1106.)
+  F.scaled_dot_product_attention(weird, weird, weird, is_causal=True)
+/home/miaohy/pytorch_learn/llm/week4/sdpa_backends.py:76: UserWarning: Flash attention only supports gpu architectures in the range [sm80, sm121]. Attempting to run on a sm 7.5 gpu. (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:443.)
+  F.scaled_dot_product_attention(weird, weird, weird, is_causal=True)
+/home/miaohy/pytorch_learn/llm/week4/sdpa_backends.py:76: UserWarning: cuDNN attention kernel not used because: (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:1108.)
+  F.scaled_dot_product_attention(weird, weird, weird, is_causal=True)
+/home/miaohy/pytorch_learn/llm/week4/sdpa_backends.py:76: UserWarning: cuDNN attention has been runtime disabled. (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:831.)
+  F.scaled_dot_product_attention(weird, weird, weird, is_causal=True)
+  head_dim=48：flash 拒绝 -> No available kernel. Aborting execution.
+  这类约束就是引擎要把 head_dim 对齐到 flash 友好值(如 64/128)的原因。
+
+要点：不指定后端时 PyTorch 自动挑最优可用后端；
+      引擎为了稳定吃到 flash 的速度，会主动满足它的 dtype/对齐约束。
