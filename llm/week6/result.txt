@@ -1,0 +1,30 @@
+(vllm-cu130) [miaohy@reco-gpu-01 week6]$ python radix_cache_mini.py 
+插入 req1: [1, 2, 3, 4, 10, 11]
+
+req2 = [1, 2, 3, 4, 20, 21]
+命中前缀 KV 槽位 = [100, 101, 102, 103]  （前 4 个 token 的 KV 直接复用，不重算！）
+只需为新增的 [20, 21] 计算 KV
+
+req3 = [1, 2, 3, 4, 10, 11, 12]
+命中前缀 KV 槽位 = [100, 101, 102, 103, 104, 105]  （连 10,11 也复用了）
+
+要点：radix tree 按最长公共前缀复用，粒度细到 token；
+      多轮对话 / 相同 system prompt 的高并发场景，命中率高、省大量 prefill。
+      对照真实源码：sglang/srt/mem_cache/radix_cache.py
+
+
+
+-----------------------------------------------------------------------------------------------------------------------------
+(vllm-cu130) [miaohy@reco-gpu-01 week6]$ python block_hash_cache_mini.py 
+req1 分到物理块 [0, 1, 2]，命中复用 0 token（首次全 miss）
+req2 分到物理块 [0, 1, 3]，命中复用 8 token
+  -> 前 2 块（8 token）命中，物理块号和 req1 相同：[0, 1] == [0, 1]
+  -> 第 3 块不同，分到新物理块
+
+=== 粒度对比 ===
+共享前缀 7 token，block_size=4 -> 只复用 4 token（尾部 3 token 不足一块，弃）
+  radix tree 则能复用到第 7 个 token（粒度更细）。这就是两者的核心差异。
+
+要点：block-hash 实现简单、和 PagedAttention 物理块对齐，但复用受 block_size 粒度限制；
+      对照真实源码：vllm/v1/core/block_pool.py, kv_cache_utils.py
+
