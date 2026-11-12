@@ -63,13 +63,19 @@ class Scheduler:
     def _kv_free(self) -> int:
         return self.kv_capacity - self.kv_used
 
-    def _preempt(self):
-        """KV 不足时，抢占最后进入 running 的请求（LIFO），把它踢回 waiting 队首。"""
-        victim = self.running.pop()          # 简化策略：抢最年轻的
+    def _preempt(self, exclude: Request | None = None):
+        """KV 不足时，抢占最后进入 running 的请求（LIFO），把它踢回 waiting 队首。
+
+        exclude 指定不能被抢的自己：否则一个请求可能为了给自己腾一块 KV 而把自己抢掉。
+        """
+        victims = [r for r in self.running if r is not exclude]
+        if not victims:
+            return None
+        victim = victims[-1]                 # 简化策略：抢最年轻的
+        self.running.remove(victim)
         self.kv_used -= victim.kv_blocks
         victim.kv_blocks = 0
         victim.prefilled = 0                 # 简化：被抢占后 KV 全丢，需重新 prefill
-        victim.generated = victim.generated  # 已生成的 token 保留（真实里 KV 重算）
         victim.status = Status.WAITING
         self.waiting.appendleft(victim)      # 回到队首，优先恢复
         return victim.rid
@@ -85,13 +91,16 @@ class Scheduler:
         for req in list(self.running):
             if budget <= 0:
                 break
+            # 本轮前面的 decode 可能为了腾 KV 把这个请求抢掉了，被抢的不再参与本步
+            if not any(r is req for r in self.running):
+                continue
             if req.done:
                 continue
-            # decode 需要为新 token 申请 1 个 KV 块
-            while self._kv_free() < 1 and self.running:
-                if self.running[-1] is req and len(self.running) == 1:
-                    break
-                pid = self._preempt()
+            # decode 需要为新 token 申请 1 个 KV 块；不够就抢占别人（不能抢自己）
+            while self._kv_free() < 1:
+                pid = self._preempt(exclude=req)
+                if pid is None:
+                    break                    # 抢无可抢，只剩自己
                 preempted.append(pid)
             if self._kv_free() < 1:
                 break
